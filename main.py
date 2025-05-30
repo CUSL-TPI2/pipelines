@@ -27,6 +27,7 @@ import json
 import uuid
 import sys
 import subprocess
+import inspect
 
 
 from config import API_KEY, PIPELINES_DIR, LOG_LEVELS
@@ -670,10 +671,19 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Pipeline {form_data.model} not found",
         )
+    
+    async def execute_pipe(pipe, *args, **kwargs):
+        if inspect.isasyncgenfunction(pipe):
+            async for res in pipe(*args, **kwargs):
+                yield res
+        elif inspect.iscoroutinefunction(pipe):
+            for item in await pipe(*args, **kwargs):
+                yield item
+        else:
+            for item in await run_in_threadpool(pipe, *args, **kwargs):
+                yield item
 
-    def job():
-        print(form_data.model)
-
+    async def job():
         pipeline = app.state.PIPELINES[form_data.model]
         pipeline_id = form_data.model
 
@@ -687,14 +697,28 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
 
         if form_data.stream:
 
-            def stream_content():
-                res = pipe(
+            async def stream_content():
+                res = execute_pipe(pipe,
                     user_message=user_message,
                     model_id=pipeline_id,
                     messages=messages,
                     body=form_data.model_dump(),
                 )
-                logging.info(f"stream:true:{res}")
+                async for line in res:
+                    if isinstance(line, BaseModel):
+                        line = line.model_dump_json()
+                        line = f"data: {line}"
+
+                    try:
+                        line = line.decode("utf-8")
+                    except:
+                        pass
+
+                    if line.startswith("data:"):
+                        yield f"{line}\n\n"
+                    else:
+                        line = stream_message_template(form_data.model, line)
+                        yield f"data: {json.dumps(line)}\n\n"
 
                 if isinstance(res, str):
                     message = stream_message_template(form_data.model, res)
@@ -744,46 +768,33 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
 
             return StreamingResponse(stream_content(), media_type="text/event-stream")
         else:
-            res = pipe(
+            res = execute_pipe(pipe,
                 user_message=user_message,
                 model_id=pipeline_id,
                 messages=messages,
                 body=form_data.model_dump(),
             )
-            logging.info(f"stream:false:{res}")
+            message = ""
+            async for stream in res:
+                message = f"{message}{stream}"
 
-            if isinstance(res, dict):
-                return res
-            elif isinstance(res, BaseModel):
-                return res.model_dump()
-            else:
+            logging.info(f"stream:false:{message}")
+            return {
+                "id": f"{form_data.model}-{str(uuid.uuid4())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": form_data.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": message,
+                        },
+                        "logprobs": None,
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
 
-                message = ""
-
-                if isinstance(res, str):
-                    message = res
-
-                if isinstance(res, Generator):
-                    for stream in res:
-                        message = f"{message}{stream}"
-
-                logging.info(f"stream:false:{message}")
-                return {
-                    "id": f"{form_data.model}-{str(uuid.uuid4())}",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": form_data.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": message,
-                            },
-                            "logprobs": None,
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-
-    return await run_in_threadpool(job)
+    return await job()
